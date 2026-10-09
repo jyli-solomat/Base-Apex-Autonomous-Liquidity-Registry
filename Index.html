@@ -1,0 +1,284 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+contract ApexAutonomousLiquidityRegistry {
+    enum PositionState { Active, Closed }
+
+    struct LiquidityPosition {
+        address payable owner;
+        uint256 suppliedETH;
+        uint256 borrowedSynthetic;
+        uint256 lastUpdateBlock;
+        PositionState state;
+        bytes32 pairKey;
+    }
+
+    address payable public immutable registryGovernor;
+    string public protocolDescriptor;
+    uint256 public swapFeeBps; // 150 = 1.5%
+    uint256 public positionCounter;
+    uint256 public totalLockedCollateral;
+    uint256 public feeReserveBalance;
+    bool public isEmergencyHalted;
+
+    mapping(bytes32 => bool) public supportedPairs;
+    mapping(uint256 => LiquidityPosition) public positions;
+
+    event PairAdded(bytes32 indexed pairKey);
+    event PairRemoved(bytes32 indexed pairKey);
+    event SwapFeeAdjusted(uint256 newFeeBps);
+    event PositionOpened(uint256 indexed positionId, address indexed owner, uint256 amount);
+    event PositionClosed(uint256 indexed positionId, uint256 refundAmount);
+    event CollateralIncreased(uint256 indexed positionId, uint256 addedAmount);
+    event CollateralDecreased(uint256 indexed positionId, uint256 withdrawnAmount);
+    event DebtRepaid(uint256 indexed positionId, uint256 amount);
+    event SyntheticLoanTaken(uint256 indexed positionId, uint256 amount);
+    event PositionCapacityRebalanced(uint256 indexed positionId);
+    event PositionOwnershipTransferred(uint256 indexed positionId, address indexed previousOwner, address indexed newOwner);
+    event SwapSimulated(address indexed trader, uint256 inputETH, uint256 netTraded);
+    event FeeRewardsCollected(address indexed receiver, uint256 amount);
+    event EmergencyHaltToggled(bool isHalted);
+    event ProtocolDescriptorUpdated(string newDescriptor);
+    event ReservesDrained(address indexed receiver, uint256 amount);
+
+    modifier onlyGovernor() {
+        require(msg.sender == registryGovernor, "Registry: Access denied");
+        _;
+    }
+
+    modifier whenNotHalted() {
+        require(!isEmergencyHalted, "Registry: Emergency halt active");
+        _;
+    }
+
+    constructor() {
+        registryGovernor = payable(msg.sender);
+        protocolDescriptor = "Apex Base Autonomous Liquidity Registry v1";
+        swapFeeBps = 150; // 1.5%
+        isEmergencyHalted = false;
+        supportedPairs[0x424153455f4554485f504f4f4c00000000000000000000000000000000000000] = true;
+    }
+
+    // 1. addSupportedPairAsset
+    function addSupportedPairAsset(bytes32 pairKey) external onlyGovernor {
+        require(!supportedPairs[pairKey], "Registry: Pair already supported");
+        supportedPairs[pairKey] = true;
+        emit PairAdded(pairKey);
+    }
+
+    // 2. adjustSwapFeeRate
+    function adjustSwapFeeRate(uint256 newFeeBps) external onlyGovernor {
+        require(newFeeBps <= 1000, "Registry: Fee cap 10%");
+        swapFeeBps = newFeeBps;
+        emit SwapFeeAdjusted(newFeeBps);
+    }
+
+    // 3. closeLiquidityPosition
+    function closeLiquidityPosition(uint256 positionId) external {
+        LiquidityPosition storage p = positions[positionId];
+        require(positionId > 0 && positionId <= positionCounter, "Registry: Invalid position ID");
+        require(p.owner == msg.sender || msg.sender == registryGovernor, "Registry: Unauthorized");
+        require(p.state == PositionState.Active, "Registry: Position not active");
+        require(p.borrowedSynthetic == 0, "Registry: Outstanding debt exists");
+
+        p.state = PositionState.Closed;
+        uint256 refund = p.suppliedETH;
+        p.suppliedETH = 0;
+        totalLockedCollateral -= refund;
+
+        if (refund > 0) {
+            (bool sent, ) = p.owner.call{value: refund}("");
+            require(sent, "Registry: Refund transfer failed");
+        }
+
+        emit PositionClosed(positionId, refund);
+    }
+
+    // 4. collectTradingFeeRewards
+    function collectTradingFeeRewards() external onlyGovernor {
+        uint256 amount = feeReserveBalance;
+        require(amount > 0, "Registry: Zero fee rewards");
+
+        feeReserveBalance = 0;
+        (bool sent, ) = registryGovernor.call{value: amount}("");
+        require(sent, "Registry: Fee transfer failed");
+
+        emit FeeRewardsCollected(registryGovernor, amount);
+    }
+
+    // 5. emergencyReserveDrain
+    function emergencyReserveDrain() external onlyGovernor {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "Registry: Zero balance");
+
+        feeReserveBalance = 0;
+        if (totalLockedCollateral > balance) {
+            totalLockedCollateral = 0;
+        } else {
+            totalLockedCollateral -= balance;
+        }
+
+        (bool sent, ) = registryGovernor.call{value: balance}("");
+        require(sent, "Registry: Drain failed");
+
+        emit ReservesDrained(registryGovernor, balance);
+    }
+
+    // 6. increasePositionCollateral
+    function increasePositionCollateral(uint256 positionId) external payable whenNotHalted {
+        LiquidityPosition storage p = positions[positionId];
+        require(positionId > 0 && positionId <= positionCounter, "Registry: Invalid position ID");
+        require(p.state == PositionState.Active, "Registry: Position closed");
+        require(msg.value > 0, "Registry: Zero top up");
+
+        p.suppliedETH += msg.value;
+        p.lastUpdateBlock = block.number;
+        totalLockedCollateral += msg.value;
+
+        emit CollateralIncreased(positionId, msg.value);
+    }
+
+    // 7. lockLiquidityPosition
+    function lockLiquidityPosition(bytes32 pairKey) external payable whenNotHalted returns (uint256) {
+        require(supportedPairs[pairKey], "Registry: Unsupported pair");
+        require(msg.value > 0, "Registry: Zero collateral");
+
+        positionCounter++;
+        positions[positionCounter] = LiquidityPosition({
+            owner: payable(msg.sender),
+            suppliedETH: msg.value,
+            borrowedSynthetic: 0,
+            lastUpdateBlock: block.number,
+            state: PositionState.Active,
+            pairKey: pairKey
+        });
+
+        totalLockedCollateral += msg.value;
+        emit PositionOpened(positionCounter, msg.sender, msg.value);
+        return positionCounter;
+    }
+
+    // 8. rebalancePositionCapacity
+    function rebalancePositionCapacity(uint256 positionId) external whenNotHalted {
+        LiquidityPosition storage p = positions[positionId];
+        require(positionId > 0 && positionId <= positionCounter, "Registry: Invalid position ID");
+        require(p.state == PositionState.Active, "Registry: Position closed");
+
+        p.lastUpdateBlock = block.number;
+        emit PositionCapacityRebalanced(positionId);
+    }
+
+    // 9. renouncePairSupport
+    function renouncePairSupport(bytes32 pairKey) external onlyGovernor {
+        require(supportedPairs[pairKey], "Registry: Pair not active");
+        supportedPairs[pairKey] = false;
+        emit PairRemoved(pairKey);
+    }
+
+    // 10. repaySyntheticDebt
+    function repaySyntheticDebt(uint256 positionId) external payable {
+        LiquidityPosition storage p = positions[positionId];
+        require(positionId > 0 && positionId <= positionCounter, "Registry: Invalid position ID");
+        require(p.state == PositionState.Active, "Registry: Position closed");
+        require(p.borrowedSynthetic > 0, "Registry: No debt");
+        require(msg.value > 0, "Registry: Zero repayment");
+
+        uint256 actualRepay = msg.value > p.borrowedSynthetic ? p.borrowedSynthetic : msg.value;
+        p.borrowedSynthetic -= actualRepay;
+
+        // Если переплатили — сразу возвращаем излишек
+        if (msg.value > actualRepay) {
+            uint256 change = msg.value - actualRepay;
+            (bool sent, ) = payable(msg.sender).call{value: change}("");
+            require(sent, "Registry: Change return failed");
+        }
+
+        emit DebtRepaid(positionId, actualRepay);
+    }
+
+    // 11. simulateSwapTrade
+    function simulateSwapTrade() external payable whenNotHalted {
+        require(msg.value > 0, "Registry: Zero swap amount");
+
+        uint256 fee = (msg.value * swapFeeBps) / 10000;
+        uint256 netAmount = msg.value - fee;
+        feeReserveBalance += fee;
+
+        (bool sent, ) = payable(msg.sender).call{value: netAmount}("");
+        require(sent, "Registry: Swap settlement return failed");
+
+        emit SwapSimulated(msg.sender, msg.value, netAmount);
+    }
+
+    // 12. takeSyntheticLoan
+    function takeSyntheticLoan(uint256 positionId, uint256 loanAmount) external whenNotHalted {
+        LiquidityPosition storage p = positions[positionId];
+        require(positionId > 0 && positionId <= positionCounter, "Registry: Invalid position ID");
+        require(p.owner == msg.sender, "Registry: Unauthorized borrower");
+        require(p.state == PositionState.Active, "Registry: Position closed");
+        require(p.borrowedSynthetic + loanAmount <= p.suppliedETH, "Registry: Loan exceeds collateral");
+        require(address(this).balance >= loanAmount, "Registry: Insufficient cash balance");
+
+        p.borrowedSynthetic += loanAmount;
+        (bool sent, ) = payable(msg.sender).call{value: loanAmount}("");
+        require(sent, "Registry: Loan payout failed");
+
+        emit SyntheticLoanTaken(positionId, loanAmount);
+    }
+
+    // 13. toggleEmergencyHalt
+    function toggleEmergencyHalt(bool isHalted) external onlyGovernor {
+        isEmergencyHalted = isHalted;
+        emit EmergencyHaltToggled(isHalted);
+    }
+
+    // 14. transferPositionOwnership
+    function transferPositionOwnership(uint256 positionId, address payable newOwner) external {
+        LiquidityPosition storage p = positions[positionId];
+        require(positionId > 0 && positionId <= positionCounter, "Registry: Invalid position ID");
+        require(p.owner == msg.sender || msg.sender == registryGovernor, "Registry: Unauthorized");
+        require(newOwner != address(0), "Registry: Zero address");
+
+        address oldOwner = p.owner;
+        p.owner = newOwner;
+
+        emit PositionOwnershipTransferred(positionId, oldOwner, newOwner);
+    }
+
+    // 15. updateProtocolDescriptor
+    function updateProtocolDescriptor(string calldata newDescriptor) external onlyGovernor {
+        require(bytes(newDescriptor).length > 0, "Registry: Empty descriptor");
+        protocolDescriptor = newDescriptor;
+        emit ProtocolDescriptorUpdated(newDescriptor);
+    }
+
+    // 16. withdrawExcessCollateral
+    function withdrawExcessCollateral(uint256 positionId, uint256 amount) external {
+        LiquidityPosition storage p = positions[positionId];
+        require(positionId > 0 && positionId <= positionCounter, "Registry: Invalid position ID");
+        require(p.owner == msg.sender, "Registry: Unauthorized");
+        require(p.state == PositionState.Active, "Registry: Position closed");
+        require(p.suppliedETH >= amount && amount > 0, "Registry: Insufficient collateral");
+        require(p.suppliedETH - amount >= p.borrowedSynthetic, "Registry: Remaining collateral below debt");
+
+        p.suppliedETH -= amount;
+        totalLockedCollateral -= amount;
+
+        (bool sent, ) = payable(msg.sender).call{value: amount}("");
+        require(sent, "Registry: Payout failed");
+
+        emit CollateralDecreased(positionId, amount);
+    }
+
+    // Read-метод
+    function getPositionDetails(uint256 positionId) external view returns (
+        address owner,
+        uint256 suppliedETH,
+        uint256 borrowedSynthetic,
+        PositionState state,
+        bytes32 pairKey
+    ) {
+        LiquidityPosition memory p = positions[positionId];
+        return (p.owner, p.suppliedETH, p.borrowedSynthetic, p.state, p.pairKey);
+    }
+}
